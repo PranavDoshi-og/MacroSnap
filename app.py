@@ -490,11 +490,10 @@ with act_col1:
 
 with act_col2:
     if st.button("📲 Send WhatsApp", disabled=summary_disabled, use_container_width=True):
-        if not st.session_state.whatsapp_number:
-            st.warning("Please configure your WhatsApp number in the sidebar or onboarding first.")
-        else:
-            with st.spinner("Summarizing & dispatching via WhatsApp..."):
-                summary_text = ask_gemini([SUMMARY_REQUEST_PROMPT])
+        with st.spinner("Generating daily summary for WhatsApp..."):
+            summary_text = ask_gemini([SUMMARY_REQUEST_PROMPT])
+            twilio_client = get_twilio_client()
+            if twilio_client:
                 success, info = send_whatsapp(
                     st.session_state.whatsapp_number, st.session_state.name, summary_text
                 )
@@ -502,15 +501,27 @@ with act_col2:
                     st.success("Sent! Check your WhatsApp 📲")
                 else:
                     st.session_state["current_summary"] = summary_text
-                    st.info(f"WhatsApp API notice: {info}. You can copy the summary below:")
+                    st.info(f"Twilio notice: {info}. You can share directly below:")
+            else:
+                st.session_state["current_summary"] = summary_text
 
 # Display summary modal/expander if triggered
 if "current_summary" in st.session_state and st.session_state["current_summary"]:
     with st.expander("📝 **Today's Nutrition Summary (Ready for WhatsApp)**", expanded=True):
-        st.text_area("Summary", st.session_state["current_summary"], height=160)
-        col_c1, col_c2 = st.columns([1, 3])
+        st.text_area("Summary Preview", st.session_state["current_summary"], height=160)
+        
+        import urllib.parse
+        encoded_summary = urllib.parse.quote(st.session_state["current_summary"])
+        clean_phone = re.sub(r"[^\d]", "", st.session_state.get("whatsapp_number", ""))
+        wa_url = f"https://api.whatsapp.com/send?phone={clean_phone}&text={encoded_summary}" if clean_phone else f"https://api.whatsapp.com/send?text={encoded_summary}"
+
+        col_c1, col_c2, col_c3 = st.columns([3, 4, 2], vertical_alignment="center")
         with col_c1:
-            if st.button("Close Summary"):
+            st.link_button("🚀 Open Directly in WhatsApp", wa_url, type="primary", use_container_width=True)
+        with col_c2:
+            st.caption("Opens WhatsApp Web or App with your recap pre-filled!")
+        with col_c3:
+            if st.button("Close", use_container_width=True):
                 st.session_state["current_summary"] = None
                 st.rerun()
 
