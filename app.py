@@ -1,9 +1,13 @@
+import datetime
 import io
 import json
 import os
 import re
+import urllib.parse
+import uuid
 from typing import Any, Dict, Optional, Tuple
 
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from PIL import Image
@@ -82,6 +86,23 @@ st.markdown(
     .stProgress > div > div > div > div {
         background-color: #10B981;
     }
+    .nutrition-card {
+        background: rgba(255, 255, 255, 0.03);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 12px;
+        padding: 16px;
+        margin-bottom: 14px;
+    }
+    .meal-card {
+        background: rgba(255, 255, 255, 0.02);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
+        padding: 12px 16px;
+        margin-bottom: 10px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -143,6 +164,14 @@ def init_session():
         st.session_state.chat = None
     if "api_key" not in st.session_state:
         st.session_state.api_key = gemini_key
+    if "water_intake_ml" not in st.session_state:
+        st.session_state.water_intake_ml = 0
+    if "water_target_ml" not in st.session_state:
+        st.session_state.water_target_ml = 2500
+    if "meal_history" not in st.session_state:
+        st.session_state.meal_history = []
+    if "last_processed_camera_hash" not in st.session_state:
+        st.session_state.last_processed_camera_hash = None
 
 
 init_session()
@@ -209,6 +238,43 @@ def add_message(role: str, kind: str, content: Any, macros: Optional[Dict[str, i
         {"role": role, "kind": kind, "content": content, "macros": macros}
     )
     render_message(st.session_state.messages[-1])
+
+
+def log_meal_entry(name: str, macros: Dict[str, int]):
+    """Record a meal into daily totals and history log."""
+    st.session_state.daily_totals["calories"] += macros["calories"]
+    st.session_state.daily_totals["protein"] += macros["protein"]
+    st.session_state.daily_totals["carbs"] += macros["carbs"]
+    st.session_state.daily_totals["fat"] += macros["fat"]
+
+    now_str = datetime.datetime.now().strftime("%I:%M %p")
+    clean_name = name.strip() if name and name.strip() else "Logged Meal"
+    if len(clean_name) > 65:
+        clean_name = clean_name[:62] + "..."
+
+    st.session_state.meal_history.append({
+        "id": str(uuid.uuid4())[:8],
+        "time": now_str,
+        "name": clean_name,
+        "calories": macros["calories"],
+        "protein": macros["protein"],
+        "carbs": macros["carbs"],
+        "fat": macros["fat"],
+    })
+
+
+def remove_meal_entry(meal_id: str):
+    """Remove a meal from history and deduct its values from daily totals."""
+    for i, m in enumerate(st.session_state.meal_history):
+        if m["id"] == meal_id:
+            st.session_state.daily_totals["calories"] = max(0, st.session_state.daily_totals["calories"] - m["calories"])
+            st.session_state.daily_totals["protein"] = max(0, st.session_state.daily_totals["protein"] - m["protein"])
+            st.session_state.daily_totals["carbs"] = max(0, st.session_state.daily_totals["carbs"] - m["carbs"])
+            st.session_state.daily_totals["fat"] = max(0, st.session_state.daily_totals["fat"] - m["fat"])
+            removed_name = m["name"]
+            st.session_state.meal_history.pop(i)
+            st.toast(f"Removed '{removed_name}' and updated daily totals!", icon="🗑️")
+            st.rerun()
 
 
 def ask_gemini(parts) -> str:
@@ -373,6 +439,8 @@ if not st.session_state.onboarded:
                     ),
                 )
                 st.session_state.messages = []
+                st.session_state.meal_history = []
+                st.session_state.water_intake_ml = 0
                 st.session_state.onboarded = True
                 st.rerun()
             except Exception as e:
@@ -413,10 +481,15 @@ with st.sidebar:
     tot = st.session_state.daily_totals
     tar = st.session_state.daily_targets
 
-    # Calories Progress
+    # Calories Progress & Remaining Calculation
+    cal_rem = tar["calories"] - tot["calories"]
     cal_pct = min(1.0, tot["calories"] / max(1, tar["calories"]))
     st.write(f"**Calories:** {tot['calories']} / {tar['calories']} kcal")
     st.progress(cal_pct)
+    if cal_rem >= 0:
+        st.caption(f"🟢 **{cal_rem:,} kcal remaining** today")
+    else:
+        st.caption(f"⚠️ **{abs(cal_rem):,} kcal over target**")
 
     # Protein Progress
     p_pct = min(1.0, tot["protein"] / max(1, tar["protein"]))
@@ -432,6 +505,62 @@ with st.sidebar:
     f_pct = min(1.0, tot["fat"] / max(1, tar["fat"]))
     st.write(f"🥑 **Fat:** {tot['fat']}g / {tar['fat']}g")
     st.progress(f_pct)
+
+    # Macro Energy Ratio
+    if tot["calories"] > 0:
+        p_cals = tot["protein"] * 4
+        c_cals = tot["carbs"] * 4
+        f_cals = tot["fat"] * 9
+        total_macro_cals = max(1, p_cals + c_cals + f_cals)
+        p_ratio = int(round((p_cals / total_macro_cals) * 100))
+        c_ratio = int(round((c_cals / total_macro_cals) * 100))
+        f_ratio = max(0, 100 - p_ratio - c_ratio)
+
+        st.markdown("##### ⚡ **Energy Ratio**")
+        st.markdown(
+            f"""
+            <div style="background: rgba(255,255,255,0.04); border-radius: 8px; padding: 10px; border: 1px solid rgba(255,255,255,0.1);">
+                <div style="display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin-bottom: 8px;">
+                    <div style="width: {p_ratio}%; background: #ef4444;" title="Protein {p_ratio}%"></div>
+                    <div style="width: {c_ratio}%; background: #3b82f6;" title="Carbs {c_ratio}%"></div>
+                    <div style="width: {f_ratio}%; background: #a855f7;" title="Fat {f_ratio}%"></div>
+                </div>
+                <div style="display: flex; justify-content: space-between; font-size: 0.75rem;">
+                    <span style="color: #ef4444; font-weight: 600;">🥩 P: {p_ratio}%</span>
+                    <span style="color: #3b82f6; font-weight: 600;">🍞 C: {c_ratio}%</span>
+                    <span style="color: #a855f7; font-weight: 600;">🥑 F: {f_ratio}%</span>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+    # Hydration Tracker
+    st.markdown("#### 💧 **Hydration Tracker**")
+    w_tot = st.session_state.water_intake_ml
+    w_tar = st.session_state.water_target_ml
+    w_pct = min(1.0, w_tot / max(1, w_tar))
+
+    st.write(f"**Intake:** {w_tot:,} / {w_tar:,} ml ({int(w_pct * 100)}%)")
+    st.progress(w_pct)
+
+    if w_tot >= w_tar:
+        st.caption("🎉 Hydration target reached! Great work!")
+
+    w_col1, w_col2, w_col3 = st.columns(3)
+    with w_col1:
+        if st.button("+250ml", use_container_width=True, help="1 standard glass"):
+            st.session_state.water_intake_ml += 250
+            st.rerun()
+    with w_col2:
+        if st.button("+500ml", use_container_width=True, help="1 water bottle"):
+            st.session_state.water_intake_ml += 500
+            st.rerun()
+    with w_col3:
+        if st.button("-250ml", use_container_width=True, help="Undo 1 glass"):
+            st.session_state.water_intake_ml = max(0, st.session_state.water_intake_ml - 250)
+            st.rerun()
 
     st.markdown("---")
     st.markdown("#### ⚡ **Quick Log Presets**")
@@ -462,6 +591,8 @@ with st.sidebar:
 
         if st.button("🔄 Reset Daily Tracker", use_container_width=True):
             st.session_state.daily_totals = {"calories": 0, "protein": 0, "carbs": 0, "fat": 0}
+            st.session_state.water_intake_ml = 0
+            st.session_state.meal_history = []
             st.session_state.messages = []
             client = get_gemini_client(active_api_key)
             st.session_state.chat = client.chats.create(
@@ -471,27 +602,34 @@ with st.sidebar:
                     temperature=0.4,
                 ),
             )
+            st.toast("Daily tracker and history reset!", icon="🔄")
             st.rerun()
 
 
-# ==================== MAIN CHAT HEADER ====================
+# ==================== MAIN HEADER ====================
 head_col, act_col1, act_col2 = st.columns([4, 2, 2], vertical_alignment="center")
 
 with head_col:
     st.title("🥗 MacroSnap")
-    st.caption("AI Meal Analysis • Instant Macros • Daily Recaps")
+    st.caption("AI Meal Analysis • Instant Macros • Food Diary • WhatsApp Recaps")
 
 with act_col1:
     summary_disabled = len(st.session_state.messages) <= 1
     if st.button("📋 Daily Summary", disabled=summary_disabled, use_container_width=True):
         with st.spinner("Generating daily summary..."):
-            summary_text = ask_gemini([SUMMARY_REQUEST_PROMPT])
+            summary_prompt = SUMMARY_REQUEST_PROMPT
+            if st.session_state.water_intake_ml > 0:
+                summary_prompt += f"\n- Hydration Logged: {st.session_state.water_intake_ml} ml / {st.session_state.water_target_ml} ml. Please include this in the recap."
+            summary_text = ask_gemini([summary_prompt])
             st.session_state["current_summary"] = summary_text
 
 with act_col2:
     if st.button("📲 Send WhatsApp", disabled=summary_disabled, use_container_width=True):
         with st.spinner("Generating daily summary for WhatsApp..."):
-            summary_text = ask_gemini([SUMMARY_REQUEST_PROMPT])
+            summary_prompt = SUMMARY_REQUEST_PROMPT
+            if st.session_state.water_intake_ml > 0:
+                summary_prompt += f"\n- Hydration Logged: {st.session_state.water_intake_ml} ml / {st.session_state.water_target_ml} ml. Please include this in the recap."
+            summary_text = ask_gemini([summary_prompt])
             twilio_client = get_twilio_client()
             if twilio_client:
                 success, info = send_whatsapp(
@@ -510,7 +648,6 @@ if "current_summary" in st.session_state and st.session_state["current_summary"]
     with st.expander("📝 **Today's Nutrition Summary (Ready for WhatsApp)**", expanded=True):
         st.text_area("Summary Preview", st.session_state["current_summary"], height=160)
         
-        import urllib.parse
         encoded_summary = urllib.parse.quote(st.session_state["current_summary"])
         clean_phone = re.sub(r"[^\d]", "", st.session_state.get("whatsapp_number", ""))
         wa_url = f"https://api.whatsapp.com/send?phone={clean_phone}&text={encoded_summary}" if clean_phone else f"https://api.whatsapp.com/send?text={encoded_summary}"
@@ -527,66 +664,252 @@ if "current_summary" in st.session_state and st.session_state["current_summary"]
 
 st.markdown("---")
 
-# Render initial greeting or full message history
-if not st.session_state.messages:
-    add_message(
-        "assistant",
-        "text",
-        WELCOME_MESSAGE_TEMPLATE.format(name=st.session_state.name),
+# ==================== MAIN WORKSPACE TABS ====================
+tab_chat, tab_diary, tab_calculator = st.tabs([
+    "💬 Chat & Snap",
+    "🍽️ Food Diary & Analytics",
+    "🎯 TDEE & Goal Calculator",
+])
+
+
+# ==================== TAB 1: CHAT & SNAP ====================
+with tab_chat:
+    # Live Camera Expander
+    with st.expander("📸 **Live Camera Snap** (Mobile & Webcam)", expanded=False):
+        st.caption("Snap what is on your plate directly from your device camera:")
+        camera_photo = st.camera_input("Take a photo of your meal", label_visibility="collapsed")
+        if camera_photo is not None:
+            photo_bytes = camera_photo.getvalue()
+            photo_hash = hash(photo_bytes)
+            if st.session_state.last_processed_camera_hash != photo_hash:
+                st.session_state.last_processed_camera_hash = photo_hash
+                add_message("user", "image", photo_bytes)
+                parts = [
+                    types.Part.from_bytes(data=photo_bytes, mime_type=camera_photo.type),
+                    "Analyze this food photo. Estimate the portion size, total calories (kcal), and macronutrients (protein, carbs, fat in grams).",
+                ]
+                with st.spinner("Analyzing your snapshot with Gemini..."):
+                    raw_answer = ask_gemini(parts)
+                    clean_answer, macros = extract_macros(raw_answer)
+                    if macros:
+                        log_meal_entry("Live Camera Snapshot", macros)
+                    add_message("assistant", "text", clean_answer, macros=macros)
+                    st.rerun()
+
+    # Render initial greeting or full message history
+    if not st.session_state.messages:
+        add_message(
+            "assistant",
+            "text",
+            WELCOME_MESSAGE_TEMPLATE.format(name=st.session_state.name),
+        )
+    else:
+        for msg in st.session_state.messages:
+            render_message(msg)
+
+    # Check preset input from quick buttons
+    preset_text = st.session_state.pop("preset_input", None)
+
+    # Chat Input supporting text and file attachment
+    user_input = st.chat_input(
+        "Describe your meal, or attach a photo...",
+        accept_file=True,
+        file_type=["jpg", "jpeg", "png", "webp"],
     )
-else:
-    for msg in st.session_state.messages:
-        render_message(msg)
 
-# Check preset input from quick buttons
-preset_text = st.session_state.pop("preset_input", None)
+    # Handle either chat input or preset click
+    if user_input or preset_text:
+        photo = None
+        text = ""
 
-# Chat Input supporting text and file attachment
-user_input = st.chat_input(
-    "Describe your meal, or attach a photo...",
-    accept_file=True,
-    file_type=["jpg", "jpeg", "png", "webp"],
-)
+        if user_input:
+            if hasattr(user_input, "files") and user_input.files:
+                photo = user_input.files[0]
+            if hasattr(user_input, "text"):
+                text = user_input.text
+            elif isinstance(user_input, str):
+                text = user_input
+        elif preset_text:
+            text = preset_text
 
-# Handle either chat input or preset click
-if user_input or preset_text:
-    photo = None
-    text = ""
+        parts = []
 
-    if user_input:
-        if hasattr(user_input, "files") and user_input.files:
-            photo = user_input.files[0]
-        if hasattr(user_input, "text"):
-            text = user_input.text
-        elif isinstance(user_input, str):
-            text = user_input
-    elif preset_text:
-        text = preset_text
+        if photo is not None:
+            photo_bytes = photo.getvalue()
+            add_message("user", "image", photo_bytes)
+            parts.append(types.Part.from_bytes(data=photo_bytes, mime_type=photo.type))
 
-    parts = []
+        if text:
+            add_message("user", "text", text)
+            parts.append(text)
+        elif photo is not None:
+            parts.append("What is this meal? Estimate the portion size, calories, and macros.")
 
-    if photo is not None:
-        photo_bytes = photo.getvalue()
-        add_message("user", "image", photo_bytes)
-        parts.append(types.Part.from_bytes(data=photo_bytes, mime_type=photo.type))
+        if parts:
+            with st.spinner("Analyzing meal & calculating macros..."):
+                raw_answer = ask_gemini(parts)
+                clean_answer, macros = extract_macros(raw_answer)
 
-    if text:
-        add_message("user", "text", text)
-        parts.append(text)
-    elif photo is not None:
-        parts.append("What is this meal? Estimate the portion size, calories, and macros.")
+                if macros:
+                    meal_desc = text if text else "Photo Meal Log"
+                    log_meal_entry(meal_desc, macros)
 
-    if parts:
-        with st.spinner("Analyzing meal & calculating macros..."):
-            raw_answer = ask_gemini(parts)
-            clean_answer, macros = extract_macros(raw_answer)
+                add_message("assistant", "text", clean_answer, macros=macros)
+                st.rerun()
 
-            # Update daily totals if macros were parsed
-            if macros:
-                st.session_state.daily_totals["calories"] += macros["calories"]
-                st.session_state.daily_totals["protein"] += macros["protein"]
-                st.session_state.daily_totals["carbs"] += macros["carbs"]
-                st.session_state.daily_totals["fat"] += macros["fat"]
 
-            add_message("assistant", "text", clean_answer, macros=macros)
+# ==================== TAB 2: FOOD DIARY & ANALYTICS ====================
+with tab_diary:
+    st.markdown("### 🍽️ **Today's Food Diary & Meal Log**")
+    st.caption("Review all logged meals, inspect macronutrient breakdowns, or delete entries.")
+
+    tot = st.session_state.daily_totals
+    tar = st.session_state.daily_targets
+    meals = st.session_state.meal_history
+
+    # Analytics Metrics Row
+    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+    with m_col1:
+        st.metric("Total Meals Logged", len(meals))
+    with m_col2:
+        st.metric("Total Calories Consumed", f"{tot['calories']:,} kcal")
+    with m_col3:
+        cal_diff = tar["calories"] - tot["calories"]
+        st.metric("Calories Remaining", f"{max(0, cal_diff):,} kcal", delta=f"{cal_diff} kcal")
+    with m_col4:
+        avg_cal = int(tot["calories"] / len(meals)) if meals else 0
+        st.metric("Avg Calories / Meal", f"{avg_cal} kcal")
+
+    st.markdown("---")
+
+    if not meals:
+        st.info("No meals logged yet today. Use the **Chat & Snap** tab or **Quick Presets** to log your first meal!")
+    else:
+        st.markdown("#### 📋 **Logged Meals**")
+        for meal in meals:
+            with st.container(border=True):
+                c_info, c_macros, c_btn = st.columns([4, 4, 2], vertical_alignment="center")
+                with c_info:
+                    st.markdown(f"**⏰ {meal['time']}** — {meal['name']}")
+                with c_macros:
+                    st.markdown(
+                        f"""
+                        <div class="macro-badge-container" style="margin: 0;">
+                            <span class="macro-pill calories">🔥 {meal['calories']} kcal</span>
+                            <span class="macro-pill protein">🥩 {meal['protein']}g</span>
+                            <span class="macro-pill carbs">🍞 {meal['carbs']}g</span>
+                            <span class="macro-pill fat">🥑 {meal['fat']}g</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                with c_btn:
+                    if st.button("🗑️ Delete", key=f"del_{meal['id']}", use_container_width=True):
+                        remove_meal_entry(meal["id"])
+
+        st.markdown("---")
+        # Export Log to CSV
+        df_export = pd.DataFrame(meals)[["time", "name", "calories", "protein", "carbs", "fat"]]
+        df_export.columns = ["Time", "Meal Description", "Calories (kcal)", "Protein (g)", "Carbs (g)", "Fat (g)"]
+        csv_data = df_export.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            label="📥 Download Daily Nutrition Log (CSV)",
+            data=csv_data,
+            file_name=f"macrosnap_log_{datetime.date.today().isoformat()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+
+# ==================== TAB 3: TDEE & GOAL CALCULATOR ====================
+with tab_calculator:
+    st.markdown("### 🎯 **Scientific TDEE & Smart Macro Target Calculator**")
+    st.caption("Calculate your Basal Metabolic Rate (BMR) and Total Daily Energy Expenditure (TDEE) using the clinical Mifflin-St Jeor equation.")
+
+    with st.container(border=True):
+        calc_col1, calc_col2 = st.columns(2)
+        with calc_col1:
+            gender = st.radio("Biological Sex", ["Male", "Female"], horizontal=True)
+            age = st.number_input("Age (years)", min_value=15, max_value=100, value=25, step=1)
+            weight_kg = st.number_input("Weight (kg)", min_value=30.0, max_value=250.0, value=70.0, step=0.5)
+            height_cm = st.number_input("Height (cm)", min_value=100.0, max_value=250.0, value=175.0, step=1.0)
+        with calc_col2:
+            activity = st.selectbox(
+                "Activity Level",
+                [
+                    "Sedentary (office job, little/no exercise)",
+                    "Lightly Active (light exercise 1-3 days/week)",
+                    "Moderately Active (moderate exercise 3-5 days/week)",
+                    "Very Active (hard exercise 6-7 days/week)",
+                    "Extra Active (athlete, physically intense job)",
+                ],
+                index=1,
+            )
+            fitness_goal = st.selectbox(
+                "Primary Fitness Goal",
+                [
+                    "Maintain Current Weight",
+                    "Moderate Fat Loss (Deficit: -350 kcal/day)",
+                    "Aggressive Fat Loss (Deficit: -600 kcal/day)",
+                    "Lean Muscle Gain (Surplus: +250 kcal/day)",
+                    "Maximum Mass Gain (Surplus: +500 kcal/day)",
+                ],
+                index=0,
+            )
+
+        # Computation using Mifflin-St Jeor
+        if gender == "Male":
+            bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age + 5
+        else:
+            bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age - 161
+
+        activity_multipliers = {
+            "Sedentary (office job, little/no exercise)": 1.2,
+            "Lightly Active (light exercise 1-3 days/week)": 1.375,
+            "Moderately Active (moderate exercise 3-5 days/week)": 1.55,
+            "Very Active (hard exercise 6-7 days/week)": 1.725,
+            "Extra Active (athlete, physically intense job)": 1.9,
+        }
+        tdee = bmr * activity_multipliers[activity]
+
+        goal_offsets = {
+            "Maintain Current Weight": 0,
+            "Moderate Fat Loss (Deficit: -350 kcal/day)": -350,
+            "Aggressive Fat Loss (Deficit: -600 kcal/day)": -600,
+            "Lean Muscle Gain (Surplus: +250 kcal/day)": 250,
+            "Maximum Mass Gain (Surplus: +500 kcal/day)": 500,
+        }
+        calculated_cals = max(1200, int(round(tdee + goal_offsets[fitness_goal])))
+
+        # Macro ratios
+        # High protein recommendation: 2.0g per kg of bodyweight
+        calc_protein = int(round(weight_kg * 2.0))
+        # Healthy fats: 25% of total caloric intake
+        calc_fat = int(round((calculated_cals * 0.25) / 9.0))
+        # Carbs: Remainder of caloric intake
+        remaining_cals = max(0, calculated_cals - (calc_protein * 4) - (calc_fat * 9))
+        calc_carbs = int(round(remaining_cals / 4.0))
+
+        st.markdown("---")
+        st.markdown("#### 🔬 **Calculated Metabolic Profile**")
+        res1, res2, res3 = st.columns(3)
+        res1.metric("Basal Metabolic Rate (BMR)", f"{int(round(bmr))} kcal/day")
+        res2.metric("Maintenance TDEE", f"{int(round(tdee))} kcal/day")
+        res3.metric("Target Calories", f"{calculated_cals} kcal/day", delta=f"{goal_offsets[fitness_goal]} kcal" if goal_offsets[fitness_goal] else "0 kcal")
+
+        macro1, macro2, macro3 = st.columns(3)
+        macro1.metric("Target Protein", f"{calc_protein}g", help="2.0g per kg bodyweight for muscle recovery & satiety")
+        macro2.metric("Target Carbs", f"{calc_carbs}g", help="Fuel for workouts and daily cognitive energy")
+        macro3.metric("Target Fats", f"{calc_fat}g", help="25% of daily calories for vital hormonal health")
+
+        st.markdown("")
+        if st.button("🚀 Apply Targets to MacroSnap Tracker", type="primary", use_container_width=True):
+            st.session_state.daily_targets = {
+                "calories": calculated_cals,
+                "protein": calc_protein,
+                "carbs": calc_carbs,
+                "fat": calc_fat,
+            }
+            st.toast("✅ Daily nutrition targets successfully applied to your tracker!", icon="🎯")
             st.rerun()
